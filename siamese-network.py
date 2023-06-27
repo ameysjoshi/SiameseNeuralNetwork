@@ -1,102 +1,92 @@
 import numpy as np
 from keras.datasets import mnist
-from keras.models import Model
-from keras.layers import Input, Flatten, Dense, Dropout, Lambda
+from keras.models import Model, Sequential
+from keras.layers import Input, Flatten, Dense, Lambda, Conv2D, MaxPooling2D
 from keras.optimizers import RMSprop
 from keras import backend as K
-import random
+import matplotlib.pyplot as plt
 
-def euclidean_distance(vects):
-    x, y = vects
-    sum_square = K.sum(K.square(x - y), axis=1, keepdims=True)
-    return K.sqrt(K.maximum(sum_square, K.epsilon()))
+# Load MNIST dataset
+(x_train, y_train), (x_test, y_test) = mnist.load_data()
 
-def eucl_dist_output_shape(shapes):
-    shape1, shape2 = shapes
-    return (shape1[0], 1)
+# Normalize and reshape the input images
+x_train = x_train.astype('float32') / 255
+x_test = x_test.astype('float32') / 255
+x_train = np.reshape(x_train, (len(x_train), 28, 28, 1))
+x_test = np.reshape(x_test, (len(x_test), 28, 28, 1))
 
+
+# Define the Siamese network architecture
+def siamese_network():
+    # Input placeholders
+    input_a = Input(shape=(28, 28, 1))
+    input_b = Input(shape=(28, 28, 1))
+
+    # Shared convolutional layers
+    convnet = Sequential([
+        Conv2D(64, (3, 3), activation='relu', input_shape=(28, 28, 1)),
+        MaxPooling2D(),
+        Flatten(),
+        Dense(128, activation='sigmoid')
+    ])
+
+    # Apply shared layers to both inputs
+    encoded_a = convnet(input_a)
+    encoded_b = convnet(input_b)
+
+    # Compute Euclidean distance between the encoded inputs
+    distance = Lambda(lambda x: K.sqrt(K.sum(K.square(x[0] - x[1]), axis=1, keepdims=True)))([encoded_a, encoded_b])
+
+    # Define the Siamese model
+    siamese_model = Model(inputs=[input_a, input_b], outputs=distance)
+
+    return siamese_model
+
+
+# Contrastive loss function
 def contrastive_loss(y_true, y_pred):
-    '''Contrastive loss from Hadsell-et-al.'06
-    http://yann.lecun.com/exdb/publis/pdf/hadsell-chopra-lecun-06.pdf
-    '''
     margin = 1
-    square_pred = K.square(y_pred)
-    margin_square = K.square(K.maximum(margin - y_pred, 0))
-    return K.mean(y_true * square_pred + (1 - y_true) * margin_square)
+    y_true = K.cast(y_true, dtype='float32')  # Cast y_true to float32
+    return K.mean((1 - y_true) * K.square(y_pred) + y_true * K.square(K.maximum(margin - y_pred, 0)))
 
-def create_pairs(x, digit_indices):
-    '''Positive and negative pair creation.
-    Alternates between positive and negative pairs.
-    '''
+
+
+# Compile the model
+model = siamese_network()
+model.compile(loss=contrastive_loss, optimizer=RMSprop(), metrics=['accuracy'])
+
+
+# Generate training pairs
+def generate_pairs(x, y, num_pairs):
     pairs = []
     labels = []
-    n = min([len(digit_indices[d]) for d in range(10)]) - 1
-    for d in range(10):
-        for i in range(n):
-            z1, z2 = digit_indices[d][i], digit_indices[d][i + 1]
-            pairs += [[x[z1], x[z2]]]
-            labels += [1]
-            inc = random.randrange(1, 10)
-            dn = (d + inc) % 10
-            z1, z2 = digit_indices[d][i], digit_indices[dn][i]
-            pairs += [[x[z1], x[z2]]]
-            labels += [0]
+    digits = np.unique(y)
+
+    for _ in range(num_pairs):
+        # Select a random digit
+        digit = np.random.choice(digits)
+
+        # Select two random samples for the same digit
+        indices = np.where(y == digit)[0]
+        idx1, idx2 = np.random.choice(indices, size=2, replace=False)
+        pairs.append([x[idx1], x[idx2]])
+        labels.append(1)
+
+        # Select two random samples for different digits
+        indices = np.where(y != digit)[0]
+        idx1, idx2 = np.random.choice(indices, size=2, replace=False)
+        pairs.append([x[idx1], x[idx2]])
+        labels.append(0)
+
     return np.array(pairs), np.array(labels)
 
-def create_base_network(input_shape):
-    '''Base network to be shared (eq. to feature extraction).
-    '''
-    input = Input(shape=input_shape)
-    x = Flatten()(input)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.1)(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.1)(x)
-    x = Dense(128, activation='relu')(x)
-    return Model(input, x)
 
-def create_siamese_network(input_shape):
-    # network definition
-    base_network = create_base_network(input_shape)
-    
-    input_a = Input(shape=input_shape)
-    input_b = Input(shape=input_shape)
-    
-    # because we re-use the same instance `base_network`,
-    # the weights of the network
-    # will be shared across the two branches
-    processed_a = base_network(input_a)
-    processed_b = base_network(input_b)
-    
-    distance = Lambda(euclidean_distance,
-                      output_shape=eucl_dist_output_shape)([processed_a, processed_b])
-    
-    model = Model([input_a, input_b], distance)
-    
-    # train
-    rms = RMSprop()
-    model.compile(loss=contrastive_loss, optimizer=rms)
-    return model
+# Generate training and validation pairs
+train_pairs, train_labels = generate_pairs(x_train, y_train, num_pairs=50000)
+val_pairs, val_labels = generate_pairs(x_test, y_test, num_pairs=10000)
 
-# prepare data
-(x_train, y_train), (x_test, y_test) = mnist.load_data()
-x_train = x_train.astype('float32')
-x_test = x_test.astype('float32')
-x_train /= 255
-x_test /= 255
-input_shape = x_train.shape[1:]
-
-# create training+test positive and negative pairs
-digit_indices = [np.where(y_train == i)[0] for i in range(10)]
-tr_pairs, tr_y = create_pairs(x_train, digit_indices)
-
-digit_indices = [np.where(y_test == i)[0] for i in range(10)]
-te_pairs, te_y = create_pairs(x_test, digit_indices)
-
-# create siamese network
-siamese_net = create_siamese_network(input_shape)
-
-siamese_net.fit([tr_pairs[:, 0], tr_pairs[:, 1]], tr_y,
+# Train the model
+model.fit([train_pairs[:, 0], train_pairs[:, 1]], train_labels,
+          validation_data=([val_pairs[:, 0], val_pairs[:, 1]], val_labels),
           batch_size=128,
-          epochs=25,
-          validation_data=([te_pairs[:, 0], te_pairs[:, 1]], te_y))
+          epochs=30)
